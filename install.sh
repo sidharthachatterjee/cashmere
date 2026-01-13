@@ -34,8 +34,10 @@ DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${ASSET_NAME}"
 mkdir -p "$INSTALL_DIR"
 
 echo "Downloading ${BINARY_NAME}..."
-curl -fsSL "$DOWNLOAD_URL" -o "${INSTALL_DIR}/${BINARY_NAME}"
-chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+TMP_FILE=$(mktemp)
+curl -fsSL "$DOWNLOAD_URL" -o "$TMP_FILE"
+chmod +x "$TMP_FILE"
+mv -f "$TMP_FILE" "${INSTALL_DIR}/${BINARY_NAME}"
 
 echo "Installed ${BINARY_NAME} to ${INSTALL_DIR}/${BINARY_NAME}"
 
