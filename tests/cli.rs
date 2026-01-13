@@ -155,3 +155,232 @@ async function workflow(step: WorkflowStep) {
     println!("=== Actual Output ===");
     println!("{}", stdout);
 }
+
+#[test]
+fn test_step_promise_awaited_later_passes() {
+    // TypeScript code where step promise is assigned to variable and awaited later
+    let typescript_code = r#"
+async function workflow(step: WorkflowStep) {
+    const p = step.do('task-1', async () => {
+        return { done: true };
+    });
+    // Some other code
+    const x = 1 + 2;
+    // Now await the promise
+    await p;
+}
+"#;
+
+    let mut temp_file = NamedTempFile::with_suffix(".ts").unwrap();
+    temp_file.write_all(typescript_code.as_bytes()).unwrap();
+    let temp_path = temp_file.path().to_str().unwrap();
+
+    let mut cmd = Command::cargo_bin("cashmere").unwrap();
+    let output = cmd.arg(temp_path).output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("No issues found"),
+        "Expected no issues when step promise is awaited later\nActual output:\n{}",
+        stdout
+    );
+    assert!(output.status.success());
+
+    println!("=== Input TypeScript ===");
+    println!("{}", typescript_code);
+    println!("=== Actual Output ===");
+    println!("{}", stdout);
+}
+
+#[test]
+fn test_step_promises_awaited_with_promise_all_passes() {
+    // TypeScript code where step promises are awaited via Promise.all
+    let typescript_code = r#"
+async function workflow(step: WorkflowStep) {
+    const p1 = step.do('task-1', async () => {
+        return { done: true };
+    });
+    const p2 = step.do('task-2', async () => {
+        return { done: true };
+    });
+    const p3 = step.sleep('pause', '1 second');
+
+    await Promise.all([p1, p2, p3]);
+}
+"#;
+
+    let mut temp_file = NamedTempFile::with_suffix(".ts").unwrap();
+    temp_file.write_all(typescript_code.as_bytes()).unwrap();
+    let temp_path = temp_file.path().to_str().unwrap();
+
+    let mut cmd = Command::cargo_bin("cashmere").unwrap();
+    let output = cmd.arg(temp_path).output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("No issues found"),
+        "Expected no issues when step promises are awaited via Promise.all\nActual output:\n{}",
+        stdout
+    );
+    assert!(output.status.success());
+
+    println!("=== Input TypeScript ===");
+    println!("{}", typescript_code);
+    println!("=== Actual Output ===");
+    println!("{}", stdout);
+}
+
+#[test]
+fn test_step_promises_awaited_with_promise_race_passes() {
+    // TypeScript code where step promises are awaited via Promise.race
+    let typescript_code = r#"
+async function workflow(step: WorkflowStep) {
+    const p1 = step.do('task-1', async () => {
+        return { done: true };
+    });
+    const p2 = step.do('task-2', async () => {
+        return { done: true };
+    });
+
+    await Promise.race([p1, p2]);
+}
+"#;
+
+    let mut temp_file = NamedTempFile::with_suffix(".ts").unwrap();
+    temp_file.write_all(typescript_code.as_bytes()).unwrap();
+    let temp_path = temp_file.path().to_str().unwrap();
+
+    let mut cmd = Command::cargo_bin("cashmere").unwrap();
+    let output = cmd.arg(temp_path).output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("No issues found"),
+        "Expected no issues when step promises are awaited via Promise.race\nActual output:\n{}",
+        stdout
+    );
+    assert!(output.status.success());
+
+    println!("=== Input TypeScript ===");
+    println!("{}", typescript_code);
+    println!("=== Actual Output ===");
+    println!("{}", stdout);
+}
+
+#[test]
+fn test_step_promises_awaited_with_promise_allsettled_passes() {
+    // TypeScript code where step promises are awaited via Promise.allSettled
+    let typescript_code = r#"
+async function workflow(step: WorkflowStep) {
+    const p1 = step.do('task-1', async () => {
+        return { done: true };
+    });
+    const p2 = step.do('task-2', async () => {
+        return { done: true };
+    });
+
+    await Promise.allSettled([p1, p2]);
+}
+"#;
+
+    let mut temp_file = NamedTempFile::with_suffix(".ts").unwrap();
+    temp_file.write_all(typescript_code.as_bytes()).unwrap();
+    let temp_path = temp_file.path().to_str().unwrap();
+
+    let mut cmd = Command::cargo_bin("cashmere").unwrap();
+    let output = cmd.arg(temp_path).output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("No issues found"),
+        "Expected no issues when step promises are awaited via Promise.allSettled\nActual output:\n{}",
+        stdout
+    );
+    assert!(output.status.success());
+
+    println!("=== Input TypeScript ===");
+    println!("{}", typescript_code);
+    println!("=== Actual Output ===");
+    println!("{}", stdout);
+}
+
+#[test]
+fn test_step_promise_assigned_but_never_awaited_is_flagged() {
+    // TypeScript code where step promise is assigned but never awaited
+    let typescript_code = r#"
+async function workflow(step: WorkflowStep) {
+    const p = step.do('task-1', async () => {
+        return { done: true };
+    });
+    // p is never awaited!
+    const x = 1 + 2;
+}
+"#;
+
+    let mut temp_file = NamedTempFile::with_suffix(".ts").unwrap();
+    temp_file.write_all(typescript_code.as_bytes()).unwrap();
+    let temp_path = temp_file.path().to_str().unwrap();
+
+    let mut cmd = Command::cargo_bin("cashmere").unwrap();
+    let output = cmd.arg(temp_path).output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("`step.do` must be awaited."),
+        "Expected error for step promise that is never awaited\nActual output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Found 1 issue(s)"),
+        "Expected exactly 1 issue\nActual output:\n{}",
+        stdout
+    );
+    assert!(!output.status.success());
+
+    println!("=== Input TypeScript ===");
+    println!("{}", typescript_code);
+    println!("=== Actual Output ===");
+    println!("{}", stdout);
+}
+
+#[test]
+fn test_partial_await_only_one_promise_awaited() {
+    // TypeScript code where one step promise is awaited but another is not
+    let typescript_code = r#"
+async function workflow(step: WorkflowStep) {
+    const p1 = step.do('task-1', async () => {
+        return { done: true };
+    });
+    const p2 = step.do('task-2', async () => {
+        return { done: true };
+    });
+    // Only p1 is awaited
+    await p1;
+}
+"#;
+
+    let mut temp_file = NamedTempFile::with_suffix(".ts").unwrap();
+    temp_file.write_all(typescript_code.as_bytes()).unwrap();
+    let temp_path = temp_file.path().to_str().unwrap();
+
+    let mut cmd = Command::cargo_bin("cashmere").unwrap();
+    let output = cmd.arg(temp_path).output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("`step.do` must be awaited."),
+        "Expected error for p2 step promise that is never awaited\nActual output:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Found 1 issue(s)"),
+        "Expected exactly 1 issue (for p2)\nActual output:\n{}",
+        stdout
+    );
+    assert!(!output.status.success());
+
+    println!("=== Input TypeScript ===");
+    println!("{}", typescript_code);
+    println!("=== Actual Output ===");
+    println!("{}", stdout);
+}

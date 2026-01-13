@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::{env, fs};
 
@@ -56,10 +57,76 @@ fn offset_to_line_col(source: &str, offset: usize) -> (usize, usize) {
     (line, col)
 }
 
+/// Tracks step promise calls within a function scope
+#[derive(Debug, Default)]
+struct StepPromiseTracker {
+    /// Maps variable names to the span of the step call they were assigned from
+    /// e.g., `const p = step.do(...)` maps "p" -> span of step.do call
+    var_to_step_span: HashMap<String, Span>,
+    /// Maps step call spans to their method name (for error reporting)
+    step_span_to_name: HashMap<Span, String>,
+    /// Set of step call spans that have been awaited (directly or via Promise.all/race/etc.)
+    awaited_step_spans: HashSet<Span>,
+    /// Step calls that were not assigned to a variable and not immediately awaited
+    unassigned_unawaited_steps: Vec<(Span, String)>,
+}
+
+impl StepPromiseTracker {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a step call that was assigned to a variable
+    fn record_assigned_step(&mut self, var_name: &str, span: Span, method_name: String) {
+        self.var_to_step_span.insert(var_name.to_string(), span);
+        self.step_span_to_name.insert(span, method_name);
+    }
+
+    /// Record a step call that was NOT assigned to a variable and NOT immediately awaited
+    fn record_unassigned_unawaited_step(&mut self, span: Span, method_name: String) {
+        self.unassigned_unawaited_steps.push((span, method_name));
+    }
+
+    /// Mark a step call as awaited by its span
+    fn mark_awaited_by_span(&mut self, span: Span) {
+        self.awaited_step_spans.insert(span);
+    }
+
+    /// Mark a step call as awaited by variable name
+    fn mark_awaited_by_var(&mut self, var_name: &str) {
+        if let Some(&span) = self.var_to_step_span.get(var_name) {
+            self.awaited_step_spans.insert(span);
+        }
+    }
+
+    /// Get all step calls that were not awaited
+    fn get_unawaited_steps(&self) -> Vec<(Span, String)> {
+        let mut result = Vec::new();
+
+        // Check assigned step calls
+        for (var_name, &span) in &self.var_to_step_span {
+            if !self.awaited_step_spans.contains(&span) {
+                if let Some(method_name) = self.step_span_to_name.get(&span) {
+                    result.push((span, method_name.clone()));
+                } else {
+                    result.push((span, format!("step (var: {})", var_name)));
+                }
+            }
+        }
+
+        // Add unassigned unawaited steps
+        result.extend(self.unassigned_unawaited_steps.clone());
+
+        result
+    }
+}
+
 struct Linter<'a> {
     source: &'a str,
     file_path: &'a str,
     diagnostics: Vec<LintDiagnostic>,
+    /// Stack of trackers for nested function scopes
+    tracker_stack: Vec<StepPromiseTracker>,
 }
 
 impl<'a> Linter<'a> {
@@ -68,13 +135,42 @@ impl<'a> Linter<'a> {
             source,
             file_path,
             diagnostics: Vec::new(),
+            tracker_stack: Vec::new(),
+        }
+    }
+
+    fn current_tracker(&mut self) -> Option<&mut StepPromiseTracker> {
+        self.tracker_stack.last_mut()
+    }
+
+    fn push_tracker(&mut self) {
+        self.tracker_stack.push(StepPromiseTracker::new());
+    }
+
+    fn pop_tracker_and_report(&mut self) {
+        if let Some(tracker) = self.tracker_stack.pop() {
+            for (span, method_name) in tracker.get_unawaited_steps() {
+                self.diagnostics.push(LintDiagnostic::new(
+                    self.file_path,
+                    self.source,
+                    span,
+                    &format!(
+                        "`{}` must be awaited. Not awaiting creates a dangling Promise that can cause race conditions and swallowed errors.",
+                        method_name
+                    ),
+                    "await-step",
+                ));
+            }
         }
     }
 
     fn lint_program(&mut self, program: &Program) {
+        // Push a tracker for the top-level scope
+        self.push_tracker();
         for stmt in &program.body {
             self.lint_statement(stmt);
         }
+        self.pop_tracker_and_report();
     }
 
     fn lint_statement(&mut self, stmt: &Statement) {
@@ -83,11 +179,7 @@ impl<'a> Linter<'a> {
                 self.lint_expression(&expr_stmt.expression, false);
             }
             Statement::VariableDeclaration(decl) => {
-                for declarator in &decl.declarations {
-                    if let Some(init) = &declarator.init {
-                        self.lint_expression(init, false);
-                    }
-                }
+                self.lint_variable_declaration(decl);
             }
             Statement::FunctionDeclaration(func) => {
                 self.lint_function_body(func.body.as_deref());
@@ -114,11 +206,7 @@ impl<'a> Linter<'a> {
             Statement::ForStatement(for_stmt) => {
                 if let Some(init) = &for_stmt.init {
                     if let ForStatementInit::VariableDeclaration(decl) = init {
-                        for declarator in &decl.declarations {
-                            if let Some(init) = &declarator.init {
-                                self.lint_expression(init, false);
-                            }
-                        }
+                        self.lint_variable_declaration(decl);
                     }
                 }
                 self.lint_statement(&for_stmt.body);
@@ -191,13 +279,34 @@ impl<'a> Linter<'a> {
                 self.lint_class(class);
             }
             Declaration::VariableDeclaration(var_decl) => {
-                for declarator in &var_decl.declarations {
-                    if let Some(init) = &declarator.init {
-                        self.lint_expression(init, false);
-                    }
-                }
+                self.lint_variable_declaration(var_decl);
             }
             _ => {}
+        }
+    }
+
+    fn lint_variable_declaration(&mut self, decl: &VariableDeclaration) {
+        for declarator in &decl.declarations {
+            if let Some(init) = &declarator.init {
+                // Check if initializer is a step call
+                if let Expression::CallExpression(call) = init {
+                    if self.is_step_method_call(call) {
+                        // Get the variable name being assigned to
+                        if let BindingPattern::BindingIdentifier(id) = &declarator.id {
+                            let var_name = id.name.as_str();
+                            let method_name = self.get_step_method_name(call);
+                            if let Some(tracker) = self.current_tracker() {
+                                tracker.record_assigned_step(var_name, call.span(), method_name);
+                            }
+                        }
+                        // Still lint the call's arguments
+                        self.lint_call_arguments(call);
+                        continue;
+                    }
+                }
+                // Normal case: lint the initializer
+                self.lint_expression(init, false);
+            }
         }
     }
 
@@ -224,8 +333,76 @@ impl<'a> Linter<'a> {
 
     fn lint_function_body(&mut self, body: Option<&FunctionBody>) {
         if let Some(body) = body {
+            self.push_tracker();
             for stmt in &body.statements {
                 self.lint_statement(stmt);
+            }
+            self.pop_tracker_and_report();
+        }
+    }
+
+    /// Helper to lint only the arguments of a call expression
+    fn lint_call_arguments(&mut self, call: &CallExpression) {
+        for arg in &call.arguments {
+            if let Argument::SpreadElement(spread) = arg {
+                self.lint_expression(&spread.argument, false);
+            } else if let Some(expr) = arg.as_expression() {
+                self.lint_expression(expr, false);
+            }
+        }
+    }
+
+    /// Check if a call is Promise.all, Promise.race, Promise.allSettled, or Promise.any
+    fn is_promise_combinator_call(&self, call: &CallExpression) -> bool {
+        if let Expression::StaticMemberExpression(member) = &call.callee {
+            let method_name = member.property.name.as_str();
+            if matches!(method_name, "all" | "race" | "allSettled" | "any") {
+                if let Expression::Identifier(id) = &member.object {
+                    return id.name.as_str() == "Promise";
+                }
+            }
+        }
+        false
+    }
+
+    /// Extract identifier names from an array expression (for Promise.all([a, b, c]))
+    fn extract_identifiers_from_array(&self, arr: &ArrayExpression) -> Vec<String> {
+        let mut identifiers = Vec::new();
+        for elem in &arr.elements {
+            if let Some(expr) = elem.as_expression() {
+                if let Expression::Identifier(id) = expr {
+                    identifiers.push(id.name.to_string());
+                }
+            }
+        }
+        identifiers
+    }
+
+    /// Mark step promises as awaited when encountering await expressions
+    fn handle_await_expression(&mut self, await_expr: &AwaitExpression) {
+        let arg = &await_expr.argument;
+
+        // Case 1: await identifier (e.g., await p)
+        if let Expression::Identifier(id) = arg {
+            if let Some(tracker) = self.current_tracker() {
+                tracker.mark_awaited_by_var(id.name.as_str());
+            }
+        }
+
+        // Case 2: await Promise.all([...]) / Promise.race([...]) / etc.
+        if let Expression::CallExpression(call) = arg {
+            if self.is_promise_combinator_call(call) {
+                // Check first argument for array of promises
+                if let Some(first_arg) = call.arguments.first() {
+                    if let Some(Expression::ArrayExpression(arr)) = first_arg.as_expression() {
+                        let identifiers = self.extract_identifiers_from_array(arr);
+                        if let Some(tracker) = self.current_tracker() {
+                            for var_name in identifiers {
+                                tracker.mark_awaited_by_var(&var_name);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -233,39 +410,42 @@ impl<'a> Linter<'a> {
     fn lint_expression(&mut self, expr: &Expression, is_awaited: bool) {
         match expr {
             Expression::AwaitExpression(await_expr) => {
+                // Handle marking step promises as awaited
+                self.handle_await_expression(await_expr);
                 // The argument of await IS awaited
                 self.lint_expression(&await_expr.argument, true);
             }
             Expression::CallExpression(call) => {
                 // Check if this is a step.do or step.sleep call
-                if self.is_step_method_call(call) && !is_awaited {
+                if self.is_step_method_call(call) {
                     let method_name = self.get_step_method_name(call);
-                    self.diagnostics.push(LintDiagnostic::new(
-                        self.file_path,
-                        self.source,
-                        call.span(),
-                        &format!(
-                            "`{}` must be awaited. Not awaiting creates a dangling Promise that can cause race conditions and swallowed errors.",
-                            method_name
-                        ),
-                        "await-step",
-                    ));
+                    if is_awaited {
+                        // Immediately awaited - mark as awaited by span
+                        if let Some(tracker) = self.current_tracker() {
+                            tracker.mark_awaited_by_span(call.span());
+                        }
+                    } else {
+                        // Not immediately awaited and not in a variable assignment
+                        // Record as unassigned unawaited step
+                        if let Some(tracker) = self.current_tracker() {
+                            tracker.record_unassigned_unawaited_step(call.span(), method_name);
+                        }
+                    }
+                    // Still lint the call's arguments
+                    self.lint_call_arguments(call);
+                    return;
                 }
 
                 // Lint the callee and arguments
                 self.lint_expression(&call.callee, false);
-                for arg in &call.arguments {
-                    if let Argument::SpreadElement(spread) = arg {
-                        self.lint_expression(&spread.argument, false);
-                    } else if let Some(expr) = arg.as_expression() {
-                        self.lint_expression(expr, false);
-                    }
-                }
+                self.lint_call_arguments(call);
             }
             Expression::ArrowFunctionExpression(arrow) => {
+                self.push_tracker();
                 for stmt in &arrow.body.statements {
                     self.lint_statement(stmt);
                 }
+                self.pop_tracker_and_report();
             }
             Expression::FunctionExpression(func) => {
                 self.lint_function_body(func.body.as_deref());
