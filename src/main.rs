@@ -11,6 +11,7 @@ use walkdir::WalkDir;
 
 #[derive(Parser, Debug)]
 #[command(name = "cashmere")]
+#[command(version)]
 #[command(about = "A fast linter for Cloudflare Workflows TypeScript/JavaScript code, built with Rust.")]
 struct Args {
     /// Directory or file to lint (defaults to current directory)
