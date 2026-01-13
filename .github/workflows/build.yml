@@ -1,0 +1,61 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  release:
+    types: [created]
+
+jobs:
+  build-mac:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Run tests
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: cargo test
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cashmere-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/cashmere
+
+  release:
+    needs: build-mac
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Upload release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for dir in artifacts/cashmere-*; do
+            target=$(basename "$dir" | sed 's/cashmere-//')
+            mv "$dir/cashmere" "cashmere-$target"
+            chmod +x "cashmere-$target"
+            gh release upload "${{ github.event.release.tag_name }}" "cashmere-$target" --repo "${{ github.repository }}"
+          done

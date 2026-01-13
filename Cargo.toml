@@ -1,0 +1,17 @@
+[package]
+name = "cashmere"
+version = "0.1.0"
+edition = "2021"
+description = "A fast linter for Cloudflare Workflows TypeScript/JavaScript code, built with Rust."
+
+[dependencies]
+oxc_parser = "0.108"
+oxc_ast = "0.108"
+oxc_span = "0.108"
+oxc_allocator = "0.108"
+walkdir = "2"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"
