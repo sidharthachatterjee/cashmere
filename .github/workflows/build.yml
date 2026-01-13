@@ -5,8 +5,6 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  release:
-    types: [created]
 
 jobs:
   build-mac:
@@ -39,23 +37,37 @@ jobs:
 
   release:
     needs: build-mac
-    if: github.event_name == 'release'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Upload release assets
+      - name: Create release and upload assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          VERSION="v${{ steps.version.outputs.version }}"
+
+          # Create the release (fails silently if tag already exists)
+          gh release create "$VERSION" --title "$VERSION" --generate-notes --repo "${{ github.repository }}" || true
+
+          # Upload artifacts
           for dir in artifacts/cashmere-*; do
             target=$(basename "$dir" | sed 's/cashmere-//')
             mv "$dir/cashmere" "cashmere-$target"
             chmod +x "cashmere-$target"
-            gh release upload "${{ github.event.release.tag_name }}" "cashmere-$target" --repo "${{ github.repository }}"
+            gh release upload "$VERSION" "cashmere-$target" --repo "${{ github.repository }}" --clobber
           done
