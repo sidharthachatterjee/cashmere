@@ -17,7 +17,7 @@ await step.do('task', async () => { ... });
 ## Installation
 
 ```bash
-curl -fsSL https://github.com/sidharthachatterjee/cashmere/releases/latest/download/cashmere-$([ "$(uname -m)" = "arm64" ] && echo "aarch64" || echo "x86_64")-apple-darwin -o /usr/local/bin/cashmere && chmod +x /usr/local/bin/cashmere
+curl -fsSL https://github.com/sidharthachatterjee/cashmere/releases/latest/download/install.sh | bash
 ```
 
 ### Build from source

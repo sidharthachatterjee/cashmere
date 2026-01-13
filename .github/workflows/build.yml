@@ -71,3 +71,6 @@ jobs:
             chmod +x "cashmere-$target"
             gh release upload "$VERSION" "cashmere-$target" --repo "${{ github.repository }}" --clobber
           done
+
+          # Upload install script
+          gh release upload "$VERSION" install.sh --repo "${{ github.repository }}" --clobber
