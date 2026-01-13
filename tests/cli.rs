@@ -344,6 +344,43 @@ async function workflow(step: WorkflowStep) {
 }
 
 #[test]
+fn test_step_calls_directly_in_promise_all_passes() {
+    // TypeScript code where step calls are passed directly to Promise.all without variable assignment
+    let typescript_code = r#"
+async function workflow(step: WorkflowStep) {
+    await Promise.all([
+        step.sleep("blah", "3 minutes"),
+        step.sleep("wait on something", "4 minutes"),
+        step.waitForEvent("wait for human approval", {
+            timeout: "5 minutes",
+            type: "human_approval",
+        }),
+    ]);
+}
+"#;
+
+    let mut temp_file = NamedTempFile::with_suffix(".ts").unwrap();
+    temp_file.write_all(typescript_code.as_bytes()).unwrap();
+    let temp_path = temp_file.path().to_str().unwrap();
+
+    let mut cmd = Command::cargo_bin("cashmere").unwrap();
+    let output = cmd.arg(temp_path).output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("No issues found"),
+        "Expected no issues when step calls are directly in Promise.all\nActual output:\n{}",
+        stdout
+    );
+    assert!(output.status.success());
+
+    println!("=== Input TypeScript ===");
+    println!("{}", typescript_code);
+    println!("=== Actual Output ===");
+    println!("{}", stdout);
+}
+
+#[test]
 fn test_partial_await_only_one_promise_awaited() {
     // TypeScript code where one step promise is awaited but another is not
     let typescript_code = r#"

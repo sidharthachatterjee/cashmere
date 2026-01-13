@@ -437,9 +437,20 @@ impl<'a> Linter<'a> {
                     return;
                 }
 
-                // Lint the callee and arguments
-                self.lint_expression(&call.callee, false);
-                self.lint_call_arguments(call);
+                // Special case: if this is an awaited Promise.all/race/etc, treat array contents as awaited
+                if is_awaited && self.is_promise_combinator_call(call) {
+                    self.lint_expression(&call.callee, false);
+                    // Lint array argument with is_awaited=true so step calls inside are treated as awaited
+                    if let Some(first_arg) = call.arguments.first() {
+                        if let Some(expr) = first_arg.as_expression() {
+                            self.lint_expression(expr, true);
+                        }
+                    }
+                } else {
+                    // Lint the callee and arguments normally
+                    self.lint_expression(&call.callee, false);
+                    self.lint_call_arguments(call);
+                }
             }
             Expression::ArrowFunctionExpression(arrow) => {
                 self.push_tracker();
@@ -455,14 +466,15 @@ impl<'a> Linter<'a> {
                 self.lint_class(class);
             }
             Expression::ArrayExpression(arr) => {
+                // Propagate is_awaited to array elements (for Promise.all([step.x(), step.y()]))
                 for elem in &arr.elements {
                     match elem {
                         ArrayExpressionElement::SpreadElement(spread) => {
-                            self.lint_expression(&spread.argument, false);
+                            self.lint_expression(&spread.argument, is_awaited);
                         }
                         _ => {
                             if let Some(expr) = elem.as_expression() {
-                                self.lint_expression(expr, false);
+                                self.lint_expression(expr, is_awaited);
                             }
                         }
                     }
@@ -548,7 +560,7 @@ impl<'a> Linter<'a> {
     fn is_step_method_call(&self, call: &CallExpression) -> bool {
         if let Expression::StaticMemberExpression(member) = &call.callee {
             let method_name = member.property.name.as_str();
-            if method_name == "do" || method_name == "sleep" {
+            if matches!(method_name, "do" | "sleep" | "waitForEvent" | "sleepUntil") {
                 // Check if the object is named "step" (or ends with step-like pattern)
                 if let Expression::Identifier(id) = &member.object {
                     let name = id.name.as_str().to_lowercase();
