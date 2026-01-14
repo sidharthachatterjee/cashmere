@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_parser::{Parser as OxcParser, ParserReturn};
+use oxc_semantic::{Semantic, SemanticBuilder, SymbolId};
 use oxc_span::{GetSpan, SourceType, Span};
 
 #[derive(Debug, Clone)]
@@ -42,6 +43,12 @@ fn offset_to_line_col(source: &str, offset: usize) -> (usize, usize) {
         }
     }
     (line, col)
+}
+
+/// Context for tracking when we're inside a step.do callback
+#[derive(Debug, Clone)]
+struct StepCallbackContext {
+    method_name: String, // e.g., "step.do"
 }
 
 /// Tracks step promise calls within a function scope
@@ -108,21 +115,366 @@ impl StepPromiseTracker {
     }
 }
 
-pub struct Linter<'a> {
+/// Tracks which symbols are known to be WorkflowStep instances
+#[derive(Debug, Default)]
+struct WorkflowStepSymbols {
+    /// SymbolIds of parameters explicitly typed as WorkflowStep (TypeScript only)
+    typed_step_symbols: HashSet<SymbolId>,
+    /// SymbolIds of 2nd params of run() methods in classes extending WorkflowEntrypoint
+    /// (JavaScript heuristic - also applies to TypeScript)
+    inferred_step_symbols: HashSet<SymbolId>,
+}
+
+impl WorkflowStepSymbols {
+    fn contains(&self, symbol_id: SymbolId) -> bool {
+        self.typed_step_symbols.contains(&symbol_id)
+            || self.inferred_step_symbols.contains(&symbol_id)
+    }
+}
+
+/// Tracks imports from "cloudflare:workers"
+/// Used only for JavaScript heuristic (detecting classes that extend WorkflowEntrypoint)
+#[derive(Debug, Default)]
+struct CloudflareImports {
+    /// Maps local name -> imported name for imports from "cloudflare:workers"
+    /// e.g., if `import { WorkflowEntrypoint as WE } from "cloudflare:workers"`,
+    /// then local_to_imported["WE"] = "WorkflowEntrypoint"
+    local_to_imported: HashMap<String, String>,
+    /// SymbolIds of imported items from "cloudflare:workers"
+    symbol_ids: HashMap<String, SymbolId>,
+}
+
+impl CloudflareImports {
+    fn is_workflow_entrypoint(&self, local_name: &str) -> bool {
+        self.local_to_imported
+            .get(local_name)
+            .map(|imported| imported == "WorkflowEntrypoint")
+            .unwrap_or(false)
+    }
+
+    fn get_workflow_entrypoint_symbol(&self) -> Option<SymbolId> {
+        for (local_name, imported_name) in &self.local_to_imported {
+            if imported_name == "WorkflowEntrypoint" {
+                return self.symbol_ids.get(local_name).copied();
+            }
+        }
+        None
+    }
+}
+
+/// Find all imports from "cloudflare:workers"
+/// Used for JavaScript heuristic (detecting WorkflowEntrypoint class)
+fn find_cloudflare_imports(program: &Program) -> CloudflareImports {
+    let mut imports = CloudflareImports::default();
+
+    for stmt in &program.body {
+        if let Statement::ImportDeclaration(import_decl) = stmt {
+            let source = import_decl.source.value.as_str();
+            if source == "cloudflare:workers" {
+                if let Some(specifiers) = &import_decl.specifiers {
+                    for specifier in specifiers {
+                        if let ImportDeclarationSpecifier::ImportSpecifier(spec) = specifier {
+                            let local_name = spec.local.name.as_str().to_string();
+                            let imported_name = spec.imported.name().as_str().to_string();
+                            imports
+                                .local_to_imported
+                                .insert(local_name.clone(), imported_name);
+
+                            // Get the SymbolId for this import
+                            if let Some(symbol_id) = spec.local.symbol_id.get() {
+                                imports.symbol_ids.insert(local_name, symbol_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    imports
+}
+
+/// Check if a type annotation refers to WorkflowStep
+/// For TypeScript, we simply check if the type name is "WorkflowStep"
+/// (the type comes from @cloudflare/workers-types ambient declarations)
+fn is_workflow_step_type(type_ann: &TSTypeAnnotation) -> bool {
+    if let TSType::TSTypeReference(type_ref) = &type_ann.type_annotation {
+        if let TSTypeName::IdentifierReference(id) = &type_ref.type_name {
+            return id.name.as_str() == "WorkflowStep";
+        }
+    }
+    false
+}
+
+/// Find all parameters typed as WorkflowStep (TypeScript only)
+/// Simply looks for any parameter with type annotation "WorkflowStep"
+fn find_typed_workflow_step_symbols(program: &Program) -> HashSet<SymbolId> {
+    let mut symbols = HashSet::new();
+
+    // Helper to process function parameters
+    fn process_params(params: &FormalParameters, symbols: &mut HashSet<SymbolId>) {
+        for param in &params.items {
+            // type_annotation is directly on FormalParameter
+            if let Some(type_ann) = &param.type_annotation {
+                if is_workflow_step_type(type_ann) {
+                    // Get the symbol id from the binding pattern
+                    // BindingPattern is an enum - use get_binding_identifier()
+                    if let Some(id) = param.pattern.get_binding_identifier() {
+                        if let Some(symbol_id) = id.symbol_id.get() {
+                            symbols.insert(symbol_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Walk the AST to find all functions with WorkflowStep typed parameters
+    for stmt in &program.body {
+        match stmt {
+            Statement::FunctionDeclaration(func) => {
+                process_params(&func.params, &mut symbols);
+            }
+            Statement::ExportDefaultDeclaration(export) => {
+                if let ExportDefaultDeclarationKind::FunctionDeclaration(func) = &export.declaration
+                {
+                    process_params(&func.params, &mut symbols);
+                }
+                if let ExportDefaultDeclarationKind::ClassDeclaration(class) = &export.declaration {
+                    process_class_methods(class, &mut symbols);
+                }
+            }
+            Statement::ExportNamedDeclaration(export) => {
+                if let Some(Declaration::FunctionDeclaration(func)) = &export.declaration {
+                    process_params(&func.params, &mut symbols);
+                }
+                if let Some(Declaration::ClassDeclaration(class)) = &export.declaration {
+                    process_class_methods(class, &mut symbols);
+                }
+            }
+            Statement::ClassDeclaration(class) => {
+                process_class_methods(class, &mut symbols);
+            }
+            Statement::VariableDeclaration(var_decl) => {
+                for declarator in &var_decl.declarations {
+                    if let Some(init) = &declarator.init {
+                        process_expression_functions(init, &mut symbols);
+                    }
+                }
+            }
+            Statement::ExpressionStatement(expr_stmt) => {
+                process_expression_functions(&expr_stmt.expression, &mut symbols);
+            }
+            _ => {}
+        }
+    }
+
+    symbols
+}
+
+/// Process class methods to find WorkflowStep typed parameters
+fn process_class_methods(class: &Class, symbols: &mut HashSet<SymbolId>) {
+    for element in &class.body.body {
+        if let ClassElement::MethodDefinition(method) = element {
+            for param in &method.value.params.items {
+                // type_annotation is directly on FormalParameter
+                if let Some(type_ann) = &param.type_annotation {
+                    if is_workflow_step_type(type_ann) {
+                        // BindingPattern is an enum - use get_binding_identifier()
+                        if let Some(id) = param.pattern.get_binding_identifier() {
+                            if let Some(symbol_id) = id.symbol_id.get() {
+                                symbols.insert(symbol_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Process function expressions (arrow functions, function expressions) for WorkflowStep params
+fn process_expression_functions(expr: &Expression, symbols: &mut HashSet<SymbolId>) {
+    match expr {
+        Expression::ArrowFunctionExpression(arrow) => {
+            for param in &arrow.params.items {
+                // type_annotation is directly on FormalParameter
+                if let Some(type_ann) = &param.type_annotation {
+                    if is_workflow_step_type(type_ann) {
+                        // BindingPattern is an enum - use get_binding_identifier()
+                        if let Some(id) = param.pattern.get_binding_identifier() {
+                            if let Some(symbol_id) = id.symbol_id.get() {
+                                symbols.insert(symbol_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Expression::FunctionExpression(func) => {
+            for param in &func.params.items {
+                // type_annotation is directly on FormalParameter
+                if let Some(type_ann) = &param.type_annotation {
+                    if is_workflow_step_type(type_ann) {
+                        // BindingPattern is an enum - use get_binding_identifier()
+                        if let Some(id) = param.pattern.get_binding_identifier() {
+                            if let Some(symbol_id) = id.symbol_id.get() {
+                                symbols.insert(symbol_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Find inferred WorkflowStep symbols (2nd param of run() in classes extending WorkflowEntrypoint)
+/// This works for both JavaScript and TypeScript
+fn find_inferred_workflow_step_symbols(
+    program: &Program,
+    semantic: &Semantic,
+    cloudflare_imports: &CloudflareImports,
+) -> HashSet<SymbolId> {
+    let mut symbols = HashSet::new();
+
+    // Get the SymbolId for WorkflowEntrypoint import (if any)
+    let workflow_entrypoint_symbol = cloudflare_imports.get_workflow_entrypoint_symbol();
+
+    // Helper to check if a class extends WorkflowEntrypoint
+    fn extends_workflow_entrypoint(
+        class: &Class,
+        semantic: &Semantic,
+        cloudflare_imports: &CloudflareImports,
+        workflow_entrypoint_symbol: Option<SymbolId>,
+    ) -> bool {
+        if let Some(super_class) = &class.super_class {
+            if let Expression::Identifier(id) = super_class {
+                // Check by name first
+                if cloudflare_imports.is_workflow_entrypoint(id.name.as_str()) {
+                    return true;
+                }
+
+                // Also check by symbol resolution
+                if let Some(expected_symbol) = workflow_entrypoint_symbol {
+                    if let Some(reference_id) = id.reference_id.get() {
+                        let reference = semantic.scoping().get_reference(reference_id);
+                        if let Some(symbol_id) = reference.symbol_id() {
+                            return symbol_id == expected_symbol;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    // Helper to get the 2nd parameter's SymbolId from a run() method
+    fn get_run_method_step_param(class: &Class) -> Option<SymbolId> {
+        for element in &class.body.body {
+            if let ClassElement::MethodDefinition(method) = element {
+                // Check if this is the "run" method
+                if let PropertyKey::StaticIdentifier(id) = &method.key {
+                    if id.name.as_str() == "run" {
+                        // Get the 2nd parameter (index 1)
+                        if let Some(param) = method.value.params.items.get(1) {
+                            // BindingPattern is an enum - use get_binding_identifier()
+                            if let Some(id) = param.pattern.get_binding_identifier() {
+                                return id.symbol_id.get();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // Walk the AST to find classes extending WorkflowEntrypoint
+    for stmt in &program.body {
+        let class = match stmt {
+            Statement::ClassDeclaration(class) => Some(class.as_ref()),
+            Statement::ExportDefaultDeclaration(export) => {
+                if let ExportDefaultDeclarationKind::ClassDeclaration(class) = &export.declaration {
+                    Some(class.as_ref())
+                } else {
+                    None
+                }
+            }
+            Statement::ExportNamedDeclaration(export) => {
+                if let Some(Declaration::ClassDeclaration(class)) = &export.declaration {
+                    Some(class.as_ref())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(class) = class {
+            if extends_workflow_entrypoint(
+                class,
+                semantic,
+                cloudflare_imports,
+                workflow_entrypoint_symbol,
+            ) {
+                if let Some(symbol_id) = get_run_method_step_param(class) {
+                    symbols.insert(symbol_id);
+                }
+            }
+        }
+    }
+
+    symbols
+}
+
+/// Build the complete WorkflowStepSymbols from the program
+fn build_workflow_step_symbols(program: &Program, semantic: &Semantic) -> WorkflowStepSymbols {
+    // For TypeScript: find parameters typed as WorkflowStep (no import needed)
+    let typed_step_symbols = find_typed_workflow_step_symbols(program);
+
+    // For JavaScript: find 2nd param of run() in classes extending WorkflowEntrypoint
+    // This requires tracking imports from "cloudflare:workers"
+    let cloudflare_imports = find_cloudflare_imports(program);
+    let inferred_step_symbols =
+        find_inferred_workflow_step_symbols(program, semantic, &cloudflare_imports);
+
+    WorkflowStepSymbols {
+        typed_step_symbols,
+        inferred_step_symbols,
+    }
+}
+
+struct Linter<'a> {
     source: &'a str,
     file_path: &'a str,
     diagnostics: Vec<LintDiagnostic>,
     /// Stack of trackers for nested function scopes
     tracker_stack: Vec<StepPromiseTracker>,
+    /// Stack for tracking when we're inside a step.do callback (for nested-step rule)
+    step_callback_stack: Vec<StepCallbackContext>,
+    /// Semantic model for symbol resolution
+    semantic: &'a Semantic<'a>,
+    /// Known WorkflowStep symbols
+    workflow_step_symbols: WorkflowStepSymbols,
 }
 
 impl<'a> Linter<'a> {
-    pub fn new(source: &'a str, file_path: &'a str) -> Self {
+    fn new(
+        source: &'a str,
+        file_path: &'a str,
+        semantic: &'a Semantic<'a>,
+        workflow_step_symbols: WorkflowStepSymbols,
+    ) -> Self {
         Self {
             source,
             file_path,
             diagnostics: Vec::new(),
             tracker_stack: Vec::new(),
+            step_callback_stack: Vec::new(),
+            semantic,
+            workflow_step_symbols,
         }
     }
 
@@ -151,7 +503,7 @@ impl<'a> Linter<'a> {
         }
     }
 
-    pub fn lint_program(&mut self, program: &Program) {
+    fn lint_program(&mut self, program: &Program) {
         // Push a tracker for the top-level scope
         self.push_tracker();
         for stmt in &program.body {
@@ -277,7 +629,8 @@ impl<'a> Linter<'a> {
                 if let Expression::CallExpression(call) = init {
                     if self.is_step_method_call(call) {
                         // Get the variable name being assigned to
-                        if let BindingPattern::BindingIdentifier(id) = &declarator.id {
+                        // BindingPattern is an enum - use get_binding_identifier()
+                        if let Some(id) = declarator.id.get_binding_identifier() {
                             let var_name = id.name.as_str();
                             let method_name = self.get_step_method_name(call);
                             if let Some(tracker) = self.current_tracker() {
@@ -404,6 +757,22 @@ impl<'a> Linter<'a> {
                 // Check if this is a step.do or step.sleep call
                 if self.is_step_method_call(call) {
                     let method_name = self.get_step_method_name(call);
+
+                    // Check for nested step calls (nested-step rule)
+                    if let Some(outer_ctx) = self.step_callback_stack.last() {
+                        self.diagnostics.push(LintDiagnostic::new(
+                            self.file_path,
+                            self.source,
+                            call.span(),
+                            &format!(
+                                "`{}` is nested inside `{}`. Nested steps are discouraged as they can cause unexpected behavior during workflow replay.",
+                                method_name,
+                                outer_ctx.method_name
+                            ),
+                            "nested-step",
+                        ));
+                    }
+
                     if is_awaited {
                         // Immediately awaited - mark as awaited by span
                         if let Some(tracker) = self.current_tracker() {
@@ -413,11 +782,18 @@ impl<'a> Linter<'a> {
                         // Not immediately awaited and not in a variable assignment
                         // Record as unassigned unawaited step
                         if let Some(tracker) = self.current_tracker() {
-                            tracker.record_unassigned_unawaited_step(call.span(), method_name);
+                            tracker
+                                .record_unassigned_unawaited_step(call.span(), method_name.clone());
                         }
                     }
-                    // Still lint the call's arguments
-                    self.lint_call_arguments(call);
+
+                    // Handle step.do callback specially for nested step detection
+                    if self.is_step_do_call(call) {
+                        self.lint_step_do_with_callback(call, &method_name);
+                    } else {
+                        // For non-step.do calls, just lint arguments normally
+                        self.lint_call_arguments(call);
+                    }
                     return;
                 }
 
@@ -540,15 +916,20 @@ impl<'a> Linter<'a> {
         }
     }
 
-    /// Check if the call expression is a step.do() or step.sleep() call
+    /// Check if the call expression is a WorkflowStep method call (do, sleep, etc.)
+    /// Uses semantic analysis to verify the object is actually a WorkflowStep
     fn is_step_method_call(&self, call: &CallExpression) -> bool {
         if let Expression::StaticMemberExpression(member) = &call.callee {
             let method_name = member.property.name.as_str();
             if matches!(method_name, "do" | "sleep" | "waitForEvent" | "sleepUntil") {
-                // Check if the object is named "step" (or ends with step-like pattern)
                 if let Expression::Identifier(id) = &member.object {
-                    let name = id.name.as_str().to_lowercase();
-                    return name == "step" || name.ends_with("step");
+                    // Use semantic resolution to check if this identifier refers to a WorkflowStep
+                    if let Some(reference_id) = id.reference_id.get() {
+                        let reference = self.semantic.scoping().get_reference(reference_id);
+                        if let Some(symbol_id) = reference.symbol_id() {
+                            return self.workflow_step_symbols.contains(symbol_id);
+                        }
+                    }
                 }
             }
         }
@@ -567,7 +948,49 @@ impl<'a> Linter<'a> {
         "step.do".to_string()
     }
 
-    pub fn into_diagnostics(self) -> Vec<LintDiagnostic> {
+    /// Check if this is specifically a step.do call (which has a callback)
+    fn is_step_do_call(&self, call: &CallExpression) -> bool {
+        if let Expression::StaticMemberExpression(member) = &call.callee {
+            let method_name = member.property.name.as_str();
+            if method_name == "do" {
+                if let Expression::Identifier(id) = &member.object {
+                    // Use semantic resolution
+                    if let Some(reference_id) = id.reference_id.get() {
+                        let reference = self.semantic.scoping().get_reference(reference_id);
+                        if let Some(symbol_id) = reference.symbol_id() {
+                            return self.workflow_step_symbols.contains(symbol_id);
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Lint a step.do call, handling the callback specially for nested step detection
+    fn lint_step_do_with_callback(&mut self, call: &CallExpression, method_name: &str) {
+        // step.do signature: step.do(name, callback, options?)
+        // The callback is the second argument (index 1)
+        for (i, arg) in call.arguments.iter().enumerate() {
+            if let Some(expr) = arg.as_expression() {
+                if i == 1 {
+                    // This is the callback argument - push context before linting
+                    self.step_callback_stack.push(StepCallbackContext {
+                        method_name: method_name.to_string(),
+                    });
+                    self.lint_expression(expr, false);
+                    self.step_callback_stack.pop();
+                } else {
+                    // Other arguments (name, options) - lint normally
+                    self.lint_expression(expr, false);
+                }
+            } else if let Argument::SpreadElement(spread) = arg {
+                self.lint_expression(&spread.argument, false);
+            }
+        }
+    }
+
+    fn into_diagnostics(self) -> Vec<LintDiagnostic> {
         self.diagnostics
     }
 }
@@ -577,7 +1000,14 @@ pub fn lint_source(source: &str, file_path: &str) -> Vec<LintDiagnostic> {
     let allocator = Allocator::default();
     let ParserReturn { program, .. } = OxcParser::new(&allocator, source, source_type).parse();
 
-    let mut linter = Linter::new(source, file_path);
+    // Build semantic model for symbol resolution
+    let semantic_ret = SemanticBuilder::new().build(&program);
+    let semantic = semantic_ret.semantic;
+
+    // Find all WorkflowStep symbols (typed for TS, inferred for JS)
+    let workflow_step_symbols = build_workflow_step_symbols(&program, &semantic);
+
+    let mut linter = Linter::new(source, file_path, &semantic, workflow_step_symbols);
     linter.lint_program(&program);
     linter.into_diagnostics()
 }
