@@ -9,6 +9,7 @@ oxc_parser = "0.108"
 oxc_ast = "0.108"
 oxc_span = "0.108"
 oxc_allocator = "0.108"
+oxc_semantic = "0.108"
 walkdir = "2"
 clap = { version = "4", features = ["derive"] }
 tower-lsp = "0.20"
