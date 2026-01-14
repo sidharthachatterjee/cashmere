@@ -30,6 +30,8 @@ The binary will be at `target/release/cashmere`.
 
 ## Usage
 
+### CLI Mode
+
 ```bash
 # Lint current directory
 cashmere
@@ -40,6 +42,64 @@ cashmere ./src
 # Lint a specific file
 cashmere ./src/workflow.ts
 ```
+
+### LSP Server Mode
+
+Run cashmere as a Language Server Protocol (LSP) server for real-time linting in your editor:
+
+```bash
+cashmere --lsp
+```
+
+#### Editor Integration
+
+**VS Code**
+
+Add to your `.vscode/settings.json`:
+
+```json
+{
+  "cashmere.enable": true,
+  "cashmere.executablePath": "/path/to/cashmere"
+}
+```
+
+Or create a VS Code extension with the following client configuration:
+
+```typescript
+const serverOptions: ServerOptions = {
+  command: 'cashmere',
+  args: ['--lsp']
+};
+
+const clientOptions: LanguageClientOptions = {
+  documentSelector: [
+    { scheme: 'file', language: 'typescript' },
+    { scheme: 'file', language: 'javascript' }
+  ]
+};
+```
+
+**Neovim**
+
+Add to your Neovim configuration:
+
+```lua
+vim.api.nvim_create_autocmd('FileType', {
+  pattern = { 'typescript', 'javascript', 'typescriptreact', 'javascriptreact' },
+  callback = function()
+    vim.lsp.start({
+      name = 'cashmere',
+      cmd = { 'cashmere', '--lsp' },
+      root_dir = vim.fs.dirname(vim.fs.find({ 'package.json' }, { upward = true })[1]),
+    })
+  end,
+})
+```
+
+**Other Editors**
+
+Any editor that supports LSP can be configured to use cashmere. The server communicates via stdin/stdout following the LSP specification.
 
 ## Supported file types
 
